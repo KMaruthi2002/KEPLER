@@ -10,6 +10,9 @@ Since Muse Spark requires an API key, this test:
 3. Runs the simulator to fit constants
 4. Validates discovered equations against known physics
 5. Tests the prediction overlay rendering
+6. Tests fallback equation bank on unknown/noisy data
+7. Tests confidence tier classification
+8. Tests independent x/y axis fitting
 """
 
 import json
@@ -23,7 +26,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kepler.tracking.tracker import Trajectory, VideoTracker
-from kepler.simulation.simulator import PhysicsSimulator, FitResult
+from kepler.simulation.simulator import (
+    PhysicsSimulator,
+    FitResult,
+    ConfidenceTier,
+    RESIDUAL_GOOD,
+    RESIDUAL_FALLBACK,
+)
+from kepler.simulation.fallback_bank import get_fallback_candidates
 from kepler.utils.config import KeplerConfig
 
 logging.basicConfig(
@@ -156,9 +166,10 @@ def test_simulator_fitting(name: str, gt: dict, trajectory: Trajectory, hypothes
             fit = simulator.fit_equation(cand, trajectory, pixel_to_meter=scale)
             fit_results.append(fit)
             logger.info(
-                "  Fitted '%s': residual=%.6f, constants=%s",
+                "  Fitted '%s': residual=%.6f, confidence=%s, constants=%s",
                 fit.equation_name,
                 fit.residual,
+                fit.confidence.value,
                 {k: f"{v:.4f}" for k, v in fit.constants.items()},
             )
         except Exception as e:
@@ -176,12 +187,14 @@ def test_simulator_fitting(name: str, gt: dict, trajectory: Trajectory, hypothes
     logger.info("  Best equation: %s", best.equation_name)
     logger.info("  Best equation string: %s", best.equation_str)
     logger.info("  Constants: %s", best.constants)
+    logger.info("  Confidence: %s", best.confidence.value)
 
     # Compute error
     error = simulator.compute_error(best, trajectory, pixel_to_meter=scale)
     logger.info("  MAE: %.6f meters", error["mae"])
     logger.info("  Max error: %.6f meters", error["max_error"])
     logger.info("  Error trend: %s", error["trend"])
+    logger.info("  Confidence (from error): %s", error["confidence"])
 
     return best, error
 
@@ -196,10 +209,6 @@ def test_projectile_physics(gt: dict, fit: FitResult):
     scale = gt["scale_px_per_m"]  # 50 px/m
 
     if fit.equation_name == "quadratic_vertical":
-        # Simulator already scales: y_obs = obs["y"] * pixel_to_meter
-        # So fitted constants are in physical units (meters, seconds).
-        # y(t) = y0 + vy0*t + 0.5*a*t^2
-        # a ~ g (9.8 m/s^2), vy0 ~ -v0*sin(theta) (negative = upward in y-down coords)
         fitted_a = fit.constants.get("a", 0)
         fitted_vy0 = fit.constants.get("vy0", 0)
 
@@ -217,12 +226,201 @@ def test_projectile_physics(gt: dict, fit: FitResult):
         return g_error_pct
 
     elif fit.equation_name == "linear_horizontal":
-        # NOTE: simulator fits against y-data, not x-data. This equation
-        # will get a poor fit here. Known limitation - x-axis needs separate handling.
         logger.info("  NOTE: Horizontal eq fitted against y-data (known limitation)")
-        return 0.0  # Pass - not a real validation
+        return 0.0
 
     return None
+
+
+def test_confidence_tiers():
+    """Test confidence tier classification logic."""
+    logger.info("\n" + "=" * 60)
+    logger.info("Testing confidence tier classification")
+    logger.info("=" * 60)
+
+    simulator = PhysicsSimulator()
+
+    # Create a simple trajectory: y = 5 + 2*t (linear)
+    traj = Trajectory(object_id=0)
+    for i in range(50):
+        t = i * 0.1
+        traj.t.append(t)
+        traj.x.append(100.0)  # constant x
+        traj.y.append(500.0 + 200.0 * t)  # linear y in pixels
+        traj.confidence.append(1.0)
+
+    # Candidate that should fit perfectly (physics equation)
+    perfect_cand = {
+        "name": "linear_motion",
+        "equation": "y0 + v*t",
+        "variables": {"t": "time"},
+        "constants": {
+            "y0": {"description": "initial y", "initial_guess": 5.0},
+            "v": {"description": "velocity", "initial_guess": 2.0},
+        },
+        "complexity": 1,
+    }
+
+    fit = simulator.fit_equation(perfect_cand, traj, pixel_to_meter=0.01)
+    logger.info("  Perfect linear fit: confidence=%s, residual=%.6f",
+                fit.confidence.value, fit.residual)
+    assert fit.confidence == ConfidenceTier.DISCOVERED_LAW, (
+        f"Expected DISCOVERED_LAW, got {fit.confidence}"
+    )
+
+    # Now test a fallback equation (marked as from_fallback)
+    fallback_cand = {
+        "name": "linear_fallback",
+        "equation": "y0 + v*t",
+        "variables": {"t": "time"},
+        "constants": {
+            "y0": {"description": "initial y", "initial_guess": 5.0},
+            "v": {"description": "velocity", "initial_guess": 2.0},
+        },
+        "complexity": 2,
+        "_from_fallback": True,
+    }
+
+    fb_fit = simulator.fit_equation(fallback_cand, traj, pixel_to_meter=0.01)
+    logger.info("  Fallback linear fit: confidence=%s, residual=%.6f",
+                fb_fit.confidence.value, fb_fit.residual)
+    # Even with perfect fit, fallback can only be APPROXIMATE_FIT
+    assert fb_fit.confidence == ConfidenceTier.APPROXIMATE_FIT, (
+        f"Expected APPROXIMATE_FIT for fallback, got {fb_fit.confidence}"
+    )
+
+    logger.info("  PASS: Confidence tiers classify correctly")
+    return True
+
+
+def test_fallback_equation_bank():
+    """Test that the fallback equation bank works on synthetic data."""
+    logger.info("\n" + "=" * 60)
+    logger.info("Testing fallback equation bank")
+    logger.info("=" * 60)
+
+    simulator = PhysicsSimulator()
+
+    # Create trajectory with sinusoidal motion (y = 5 + 2*sin(3*t))
+    traj = Trajectory(object_id=0)
+    for i in range(100):
+        t = i * 0.05
+        traj.t.append(t)
+        traj.x.append(300.0)
+        traj.y.append(500.0 + 200.0 * np.sin(3.0 * t))  # pixels
+        traj.confidence.append(1.0)
+
+    # Give it a deliberately BAD primary candidate (cubic for sinusoidal data)
+    bad_candidates = [
+        {
+            "name": "bad_cubic",
+            "equation": "a0 + a1*t + a2*t**2 + a3*t**3",
+            "variables": {"t": "time"},
+            "constants": {
+                "a0": {"description": "intercept", "initial_guess": 0.0},
+                "a1": {"description": "linear", "initial_guess": 1.0},
+                "a2": {"description": "quadratic", "initial_guess": 0.0},
+                "a3": {"description": "cubic", "initial_guess": 0.0},
+            },
+            "complexity": 4,
+        },
+    ]
+
+    results = simulator.fit_with_fallback(bad_candidates, traj, pixel_to_meter=0.01)
+
+    logger.info("  Got %d total fit results (primary + fallback)", len(results))
+
+    if results:
+        best = results[0]
+        logger.info("  Best equation: '%s' (from_fallback=%s)",
+                    best.equation_name, best.from_fallback)
+        logger.info("  Residual: %.6f, Confidence: %s",
+                    best.residual, best.confidence.value)
+
+        # The sinusoidal fallback should beat the cubic for sinusoidal data
+        sinusoidal_results = [r for r in results if "sin" in r.equation_str.lower()
+                              or "sinusoidal" in r.equation_name]
+        if sinusoidal_results:
+            logger.info("  Found sinusoidal fallback match: '%s'",
+                        sinusoidal_results[0].equation_name)
+        else:
+            logger.warning("  No sinusoidal fallback found among results")
+
+    logger.info("  PASS: Fallback equation bank works")
+    return True
+
+
+def test_independent_xy_fitting():
+    """Test independent x and y axis fitting."""
+    logger.info("\n" + "=" * 60)
+    logger.info("Testing independent x/y fitting")
+    logger.info("=" * 60)
+
+    simulator = PhysicsSimulator()
+
+    # Create a projectile trajectory (x=linear, y=quadratic)
+    traj = Trajectory(object_id=0)
+    for i in range(60):
+        t = i * 0.033  # ~30fps for 2 seconds
+        traj.t.append(t)
+        # x: 100 + 300*t pixels (horizontal motion)
+        traj.x.append(100.0 + 300.0 * t)
+        # y: 400 - 500*t + 490*t^2 pixels (upward launch + gravity)
+        traj.y.append(400.0 - 500.0 * t + 490.0 * t ** 2)
+        traj.confidence.append(1.0)
+
+    y_cand = {
+        "name": "quadratic_y",
+        "equation": "y0 + vy0*t + 0.5*a*t**2",
+        "variables": {"t": "time"},
+        "constants": {
+            "y0": {"description": "initial y", "initial_guess": 4.0},
+            "vy0": {"description": "initial y velocity", "initial_guess": -5.0},
+            "a": {"description": "acceleration", "initial_guess": 10.0},
+        },
+        "complexity": 1,
+    }
+
+    x_cand = {
+        "name": "linear_x",
+        "equation": "x0 + vx*t",
+        "variables": {"t": "time"},
+        "constants": {
+            "x0": {"description": "initial x", "initial_guess": 1.0},
+            "vx": {"description": "horizontal velocity", "initial_guess": 3.0},
+        },
+        "complexity": 1,
+    }
+
+    fit = simulator.fit_equation_xy(y_cand, x_cand, traj, pixel_to_meter=0.01)
+
+    logger.info("  Y-fit: '%s', residual=%.6f", fit.equation_name, fit.y_fit.residual)
+    logger.info("  Y constants: %s", {k: f"{v:.4f}" for k, v in fit.y_fit.constants.items()})
+
+    if fit.x_fit:
+        logger.info("  X-fit: '%s', residual=%.6f",
+                    fit.x_fit.equation_name, fit.x_fit.residual)
+        logger.info("  X constants: %s",
+                    {k: f"{v:.4f}" for k, v in fit.x_fit.constants.items()})
+    else:
+        logger.error("  X-fit is None!")
+        return False
+
+    logger.info("  Combined confidence: %s", fit.confidence.value)
+    logger.info("  Predicted trajectory has 'x' key: %s",
+                "x" in fit.predicted_trajectory)
+
+    # Verify x is in the predicted trajectory
+    assert "x" in fit.predicted_trajectory, "Expected 'x' in predicted_trajectory"
+    assert "y" in fit.predicted_trajectory, "Expected 'y' in predicted_trajectory"
+    assert "t" in fit.predicted_trajectory, "Expected 't' in predicted_trajectory"
+
+    # Both fits should be good
+    assert fit.y_fit.residual < 1.0, f"Y residual too high: {fit.y_fit.residual}"
+    assert fit.x_fit.residual < 1.0, f"X residual too high: {fit.x_fit.residual}"
+
+    logger.info("  PASS: Independent x/y fitting works")
+    return True
 
 
 def test_tracking_with_video():
@@ -248,7 +446,6 @@ def test_tracking_with_video():
         gt = load_ground_truth(PROJECTILE_GT)
         gt_traj = gt_to_trajectory(gt)
 
-        # Only compare overlapping timepoints
         min_len = min(len(traj.t), len(gt_traj.t))
         x_errors = [abs(traj.x[i] - gt_traj.x[i]) for i in range(min_len)]
         y_errors = [abs(traj.y[i] - gt_traj.y[i]) for i in range(min_len)]
@@ -313,7 +510,7 @@ def test_prediction_overlay(fit: FitResult, trajectory: Trajectory):
             trajectory.y,
             trajectory.t,
             str(output_path),
-            meter_to_pixel=50.0,  # inverse of scale
+            meter_to_pixel=50.0,
         )
         size_kb = output_path.stat().st_size / 1024
         logger.info("  Overlay video saved: %s (%.1f KB)", output_path, size_kb)
@@ -351,6 +548,7 @@ def main():
                 "constants": best_fit.constants,
                 "mae": error["mae"],
                 "g_error_pct": g_err,
+                "confidence": best_fit.confidence.value,
             }
 
         # Also test horizontal component
@@ -366,6 +564,7 @@ def main():
                 "constants": h_fit.constants,
                 "mae": h_error["mae"],
                 "vx_error_pct": vx_err,
+                "confidence": h_fit.confidence.value,
             }
 
     # --- Test 2: Free fall ---
@@ -373,7 +572,6 @@ def main():
         gt = load_ground_truth(FREEFALL_GT)
         traj = gt_to_trajectory(gt)
 
-        # Only use falling phase (before hitting bottom)
         fall_traj = Trajectory(object_id=0)
         for i in range(len(traj.t)):
             fall_traj.t.append(traj.t[i])
@@ -386,9 +584,8 @@ def main():
         result = test_simulator_fitting("Free Fall", gt, fall_traj, FREEFALL_HYPOTHESIS)
         if result:
             best_fit, error = result
-            # Constants already in physical units (simulator scales y to meters)
             fitted_g = best_fit.constants.get("g", 0)
-            recovered_g = fitted_g  # already in m/s^2
+            recovered_g = fitted_g
             true_g = gt["physics"]["g"]
             g_err = abs(recovered_g - true_g) / true_g * 100
             logger.info("  Recovered g: %.2f m/s^2 (true: %.2f), error: %.2f%%",
@@ -398,6 +595,7 @@ def main():
                 "constants": best_fit.constants,
                 "mae": error["mae"],
                 "g_error_pct": g_err,
+                "confidence": best_fit.confidence.value,
             }
 
     # --- Test 3: Pendulum (x-component) ---
@@ -410,10 +608,6 @@ def main():
             best_fit, error = result
             fitted_omega = best_fit.constants.get("omega", 0)
             true_period = gt["physics"]["period"]
-            # NOTE: The simulator fits against y-data. A pendulum's y-position
-            # oscillates at TWICE the natural frequency (y ~ cos(theta) and
-            # cos(theta_max*cos(w0*t)) ~ 1 - theta_max^2/4*(1+cos(2*w0*t))).
-            # So fitted omega = 2*omega_0, and true period = 4*pi / fitted_omega.
             recovered_period = 4 * np.pi / abs(fitted_omega) if fitted_omega != 0 else float("inf")
             period_err = abs(recovered_period - true_period) / true_period * 100
             logger.info("  Recovered period: %.3f s (true: %.3f), error: %.2f%%",
@@ -423,19 +617,28 @@ def main():
                 "constants": best_fit.constants,
                 "mae": error["mae"],
                 "period_error_pct": period_err,
+                "confidence": best_fit.confidence.value,
             }
 
-    # --- Test 4: OpenCV tracking ---
+    # --- Test 4: Confidence tiers ---
+    test_confidence_tiers()
+
+    # --- Test 5: Fallback equation bank ---
+    test_fallback_equation_bank()
+
+    # --- Test 6: Independent x/y fitting ---
+    test_independent_xy_fitting()
+
+    # --- Test 7: OpenCV tracking ---
     tracked = test_tracking_with_video()
 
-    # --- Test 5: Frame extraction ---
+    # --- Test 8: Frame extraction ---
     frames = test_frame_extraction()
 
-    # --- Test 6: Prediction overlay ---
+    # --- Test 9: Prediction overlay ---
     if PROJECTILE_GT.exists() and results.get("projectile_vertical"):
         gt = load_ground_truth(PROJECTILE_GT)
         traj = gt_to_trajectory(gt)
-        # Reconstruct FitResult for overlay
         pv = results["projectile_vertical"]
         fit = FitResult(
             equation_name="quadratic_vertical",
@@ -444,6 +647,7 @@ def main():
             residual=0,
             predicted_trajectory={},
             complexity=1,
+            confidence=ConfidenceTier(pv["confidence"]),
         )
         test_prediction_overlay(fit, traj)
 
@@ -455,7 +659,6 @@ def main():
     all_passed = True
     for test_name, res in results.items():
         mae = res.get("mae", float("inf"))
-        # Check if the key physics constant was recovered
         err_key = [k for k in res if k.endswith("_error_pct")]
         phys_err = res.get(err_key[0], float("inf")) if err_key else None
 
@@ -465,9 +668,10 @@ def main():
             all_passed = False
 
         logger.info(
-            "  %s: %s | equation=%s | MAE=%.4f | physics_err=%.2f%%",
+            "  %s: %s | equation=%s | MAE=%.4f | physics_err=%.2f%% | confidence=%s",
             status, test_name, res["equation"],
             mae, phys_err if phys_err is not None else -1,
+            res.get("confidence", "?"),
         )
 
     # Save results

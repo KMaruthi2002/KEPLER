@@ -4,7 +4,8 @@ Refinement loop module.
 Implements the error-driven feedback cycle:
 1. Compare simulation predictions to observed trajectories
 2. Feed error data back to Muse Spark for equation revision
-3. Repeat until convergence or max iterations
+3. Fall back to generic equation bank when Muse Spark candidates fail
+4. Repeat until convergence or max iterations
 """
 
 import logging
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from kepler.tracking.tracker import Trajectory
 from kepler.hypothesis.muse_spark import MuseSpark
-from kepler.simulation.simulator import PhysicsSimulator, FitResult
+from kepler.simulation.simulator import PhysicsSimulator, FitResult, ConfidenceTier
 from kepler.utils.config import KeplerConfig
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class RefinementResult:
         self.best_fit: FitResult | None = None
         self.converged: bool = False
         self.final_error: dict | None = None
+        self.used_fallback: bool = False
 
     @property
     def num_iterations(self) -> int:
@@ -37,6 +39,8 @@ class RefinementLoop:
     Error-driven refinement loop.
 
     Observe -> Hypothesize -> Simulate -> Compare -> Refine -> repeat.
+    Falls back to a generic equation bank when Muse Spark candidates
+    produce high residuals after all refinement iterations.
     """
 
     def __init__(self, config: KeplerConfig | None = None):
@@ -93,9 +97,10 @@ class RefinementLoop:
                     fit = self.simulator.fit_equation(cand, trajectory, pixel_to_meter)
                     fit_results.append(fit)
                     logger.info(
-                        "  Fitted '%s': residual=%.6f",
+                        "  Fitted '%s': residual=%.6f, confidence=%s",
                         fit.equation_name,
                         fit.residual,
+                        fit.confidence.value,
                     )
                 except (ValueError, Exception) as e:
                     logger.warning("  Could not fit '%s': %s", cand.get("name", "?"), e)
@@ -116,21 +121,27 @@ class RefinementLoop:
                 "constants": best.constants,
                 "residual": best.residual,
                 "error": error,
+                "confidence": best.confidence.value,
             }
             result.iterations.append(iteration_record)
             result.best_fit = best
             result.final_error = error
 
             logger.info(
-                "  Best: '%s' | MAE=%.6f | trend=%s",
+                "  Best: '%s' | MAE=%.6f | trend=%s | confidence=%s",
                 best.equation_name,
                 error["mae"],
                 error["trend"],
+                best.confidence.value,
             )
 
             # Check convergence
             if error["mae"] < error_threshold:
-                logger.info("Converged! MAE below threshold (%.6f < %.6f).", error["mae"], error_threshold)
+                logger.info(
+                    "Converged! MAE below threshold (%.6f < %.6f).",
+                    error["mae"],
+                    error_threshold,
+                )
                 result.converged = True
                 break
 
@@ -147,14 +158,59 @@ class RefinementLoop:
                 )
                 candidates = refined.get("candidates", [])
                 if not candidates:
-                    logger.warning("Muse Spark returned no refined candidates. Stopping.")
+                    logger.warning(
+                        "Muse Spark returned no refined candidates. Stopping."
+                    )
                     break
+
+        # --- Fallback phase ---
+        # If the best result is not good enough after refinement, try the
+        # fallback equation bank.
+        if result.best_fit and not result.converged:
+            best_conf = result.best_fit.confidence
+            if best_conf in (
+                ConfidenceTier.TRACKING_ONLY,
+                ConfidenceTier.APPROXIMATE_FIT,
+            ):
+                logger.info(
+                    "Best fit confidence is '%s'. "
+                    "Trying fallback equation bank...",
+                    best_conf.value,
+                )
+                # Collect all original candidates from the last iteration
+                fallback_ranked = self.simulator.fit_with_fallback(
+                    candidates, trajectory, pixel_to_meter
+                )
+                if fallback_ranked:
+                    fb_best = fallback_ranked[0]
+                    fb_error = self.simulator.compute_error(
+                        fb_best, trajectory, pixel_to_meter
+                    )
+
+                    # Accept the fallback if it beats the current best
+                    if fb_best.residual < result.best_fit.residual:
+                        logger.info(
+                            "Fallback equation '%s' beats previous best "
+                            "(residual %.6f < %.6f). Adopting.",
+                            fb_best.equation_name,
+                            fb_best.residual,
+                            result.best_fit.residual,
+                        )
+                        result.best_fit = fb_best
+                        result.final_error = fb_error
+                        result.used_fallback = fb_best.from_fallback
+
+                        # Check if the fallback achieves convergence
+                        if fb_error["mae"] < error_threshold:
+                            result.converged = True
 
         if not result.converged:
             logger.info(
-                "Refinement did not converge after %d iterations. Best MAE=%.6f",
+                "Refinement did not converge after %d iterations. "
+                "Best MAE=%.6f, confidence=%s",
                 result.num_iterations,
                 result.final_error["mae"] if result.final_error else float("inf"),
+                result.best_fit.confidence.value if result.best_fit else "none",
             )
 
         return result
