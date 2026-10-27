@@ -213,8 +213,15 @@ class VideoTracker:
         roi: tuple[int, int, int, int],
         fps: float,
     ) -> Trajectory:
-        """Track a single ROI through the video using CSRT."""
-        tracker = cv2.TrackerCSRT.create()
+        """Track a single ROI through the video using best available tracker."""
+        # Try trackers in preference order (OpenCV 5 dropped CSRT)
+        # TrackerVit/DaSiamRPN need model files, so MIL is the safe default
+        if hasattr(cv2, 'TrackerCSRT'):
+            tracker = cv2.TrackerCSRT.create()
+            logger.info("Using OpenCV CSRT tracker")
+        else:
+            tracker = cv2.TrackerMIL.create()
+            logger.info("Using OpenCV MIL tracker")
         tracker.init(first_frame, roi)
 
         traj = Trajectory(object_id=0)
