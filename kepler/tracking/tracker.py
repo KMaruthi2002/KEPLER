@@ -1,16 +1,21 @@
 """
 Object tracking module.
 
-Extracts object trajectories from video using SAM 3.1 (or fallback
-to OpenCV tracking when SAM is not available).
+Extracts object trajectories from video using SAM 2 for high-accuracy
+segmentation-based tracking, with OpenCV CSRT as the fallback when
+SAM 2 or a CUDA GPU is not available.
 """
 
-import cv2
-import numpy as np
+import logging
 from pathlib import Path
 from dataclasses import dataclass, field
 
+import cv2
+import numpy as np
+
 from kepler.utils.config import KeplerConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,12 +48,15 @@ class VideoTracker:
     """
     Extract object trajectories from video.
 
-    Currently uses OpenCV-based tracking as the local fallback.
-    SAM 3.1 integration will be added when the endpoint is available.
+    Backend selection (controlled by config.tracking.backend):
+      - "auto": tries SAM 2 first, falls back to OpenCV CSRT
+      - "sam2": SAM 2 only (errors if unavailable)
+      - "opencv": OpenCV CSRT only
     """
 
     def __init__(self, config: KeplerConfig | None = None):
         self.config = config or KeplerConfig()
+        self._sam_tracker = None
 
     def extract_frames(self, video_path: str | Path, max_frames: int = 6) -> list[np.ndarray]:
         """Extract evenly spaced frames from a video for Muse Spark."""
@@ -88,26 +96,10 @@ class VideoTracker:
         """
         Track objects through a video and return their trajectories.
 
-        Uses OpenCV CSRT tracker as a baseline. The user selects the
-        object(s) to track from the first frame.
+        Routes through the configured backend (SAM 2 or OpenCV).
         """
-        video_path = str(video_path)
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open video: {video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-        # Read first frame
-        ret, first_frame = cap.read()
-        if not ret:
-            raise ValueError("Cannot read first frame")
-
-        # For now, use simple detection (color-based or manual ROI)
-        # This will be replaced by SAM 3.1 when available
-        trajectories = self._track_with_opencv(cap, first_frame, fps)
-        cap.release()
-        return trajectories
+        # Use the auto-track path which handles backend selection
+        return self.track_objects_auto(video_path)
 
     def track_objects_auto(
         self, video_path: str | Path, roi: tuple[int, int, int, int] | None = None
@@ -117,7 +109,31 @@ class VideoTracker:
 
         If no ROI is given, attempts simple motion-based detection to find
         the primary moving object.
+
+        Backend selection follows config.tracking.backend:
+          "auto" -> try SAM 2, fall back to OpenCV
+          "sam2" -> SAM 2 only
+          "opencv" -> OpenCV only
         """
+        backend = self.config.tracking.backend
+
+        # Try SAM 2 first if requested
+        if backend in ("auto", "sam2"):
+            from kepler.tracking.sam_tracker import is_sam2_available
+
+            if is_sam2_available():
+                logger.info("Using SAM 2 backend for tracking")
+                return self._track_with_sam2(video_path, roi)
+            elif backend == "sam2":
+                raise RuntimeError(
+                    "SAM 2 backend requested but not available. "
+                    "Install sam2 and ensure CUDA GPU is present."
+                )
+            else:
+                logger.info("SAM 2 not available, falling back to OpenCV CSRT")
+
+        # OpenCV fallback
+        logger.info("Using OpenCV CSRT backend for tracking")
         video_path = str(video_path)
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -138,6 +154,16 @@ class VideoTracker:
         trajectory = self._track_roi(cap, first_frame, roi, fps)
         cap.release()
         return [trajectory]
+
+    def _track_with_sam2(
+        self, video_path: str | Path, roi: tuple[int, int, int, int] | None = None
+    ) -> list[Trajectory]:
+        """Delegate tracking to SAM 2."""
+        from kepler.tracking.sam_tracker import SAMTracker
+
+        if self._sam_tracker is None:
+            self._sam_tracker = SAMTracker(self.config)
+        return self._sam_tracker.track_objects(video_path, roi)
 
     def _detect_moving_object(
         self, cap: cv2.VideoCapture, first_frame: np.ndarray
