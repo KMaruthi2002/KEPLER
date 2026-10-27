@@ -29,6 +29,7 @@ data/videos/*.mov
 data/videos/*.avi
 data/trajectories/*.npy
 data/results/*.json
+data/test_results/
 !data/videos/.gitkeep
 !data/trajectories/.gitkeep
 !data/results/.gitkeep
