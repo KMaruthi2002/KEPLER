@@ -1,0 +1,37 @@
+# KEPLER default configuration
+
+tracking:
+  model: "sam-3.1"
+  backend: "baseten"
+  confidence_threshold: 0.8
+  max_objects: 10
+  fps_target: 30
+
+hypothesis:
+  model: "muse-spark"
+  max_candidates: 5
+  complexity_penalty: 0.1  # Occam's razor weight
+
+simulation:
+  model: "muse-code"
+  dt: 0.01  # simulation timestep (seconds)
+  max_horizon: 5.0  # max prediction horizon (seconds)
+  fit_max_iter: 1000
+
+refinement:
+  max_iterations: 3
+  error_threshold: 0.05  # acceptable simulation drift
+  simplicity_weight: 0.3  # balance fit vs simplicity
+
+prediction:
+  overlay_fps: 30
+  trail_length: 60  # frames of prediction trail
+  confidence_display: true
+
+evaluation:
+  dataset_dir: "data/videos"
+  results_dir: "data/results"
+  metrics:
+    - equation_recovery_rate
+    - constant_estimation_error
+    - long_horizon_prediction_error

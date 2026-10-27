@@ -1,0 +1,236 @@
+"""
+Object tracking module.
+
+Extracts object trajectories from video using SAM 3.1 (or fallback
+to OpenCV tracking when SAM is not available).
+"""
+
+import cv2
+import numpy as np
+from pathlib import Path
+from dataclasses import dataclass, field
+
+from kepler.utils.config import KeplerConfig
+
+
+@dataclass
+class Trajectory:
+    """A tracked object's trajectory through time."""
+    object_id: int
+    t: list[float] = field(default_factory=list)  # timestamps in seconds
+    x: list[float] = field(default_factory=list)  # x positions (pixels)
+    y: list[float] = field(default_factory=list)  # y positions (pixels)
+    confidence: list[float] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "object_id": self.object_id,
+            "t": self.t,
+            "x": self.x,
+            "y": self.y,
+            "confidence": self.confidence,
+        }
+
+    def to_numpy(self) -> dict[str, np.ndarray]:
+        return {
+            "t": np.array(self.t),
+            "x": np.array(self.x),
+            "y": np.array(self.y),
+        }
+
+
+class VideoTracker:
+    """
+    Extract object trajectories from video.
+
+    Currently uses OpenCV-based tracking as the local fallback.
+    SAM 3.1 integration will be added when the endpoint is available.
+    """
+
+    def __init__(self, config: KeplerConfig | None = None):
+        self.config = config or KeplerConfig()
+
+    def extract_frames(self, video_path: str | Path, max_frames: int = 6) -> list[np.ndarray]:
+        """Extract evenly spaced frames from a video for Muse Spark."""
+        video_path = str(video_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        indices = np.linspace(0, total_frames - 1, max_frames, dtype=int)
+
+        frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frames.append(frame)
+        cap.release()
+        return frames
+
+    def save_frames(
+        self, video_path: str | Path, output_dir: str | Path, max_frames: int = 6
+    ) -> list[Path]:
+        """Extract and save frames as JPEG files. Returns list of saved paths."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        frames = self.extract_frames(video_path, max_frames)
+        paths = []
+        for i, frame in enumerate(frames):
+            p = output_dir / f"frame_{i:03d}.jpg"
+            cv2.imwrite(str(p), frame)
+            paths.append(p)
+        return paths
+
+    def track_objects(self, video_path: str | Path) -> list[Trajectory]:
+        """
+        Track objects through a video and return their trajectories.
+
+        Uses OpenCV CSRT tracker as a baseline. The user selects the
+        object(s) to track from the first frame.
+        """
+        video_path = str(video_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        # Read first frame
+        ret, first_frame = cap.read()
+        if not ret:
+            raise ValueError("Cannot read first frame")
+
+        # For now, use simple detection (color-based or manual ROI)
+        # This will be replaced by SAM 3.1 when available
+        trajectories = self._track_with_opencv(cap, first_frame, fps)
+        cap.release()
+        return trajectories
+
+    def track_objects_auto(
+        self, video_path: str | Path, roi: tuple[int, int, int, int] | None = None
+    ) -> list[Trajectory]:
+        """
+        Auto-track without GUI. Optionally pass an initial ROI (x, y, w, h).
+
+        If no ROI is given, attempts simple motion-based detection to find
+        the primary moving object.
+        """
+        video_path = str(video_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        ret, first_frame = cap.read()
+        if not ret:
+            raise ValueError("Cannot read first frame")
+
+        if roi is None:
+            roi = self._detect_moving_object(cap, first_frame)
+
+        if roi is None:
+            cap.release()
+            raise ValueError("Could not detect a moving object. Provide an ROI manually.")
+
+        trajectory = self._track_roi(cap, first_frame, roi, fps)
+        cap.release()
+        return [trajectory]
+
+    def _detect_moving_object(
+        self, cap: cv2.VideoCapture, first_frame: np.ndarray
+    ) -> tuple[int, int, int, int] | None:
+        """Detect the primary moving object using frame differencing."""
+        gray_first = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+        gray_first = cv2.GaussianBlur(gray_first, (21, 21), 0)
+
+        # Read a frame ~10% into the video for comparison
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min(total // 10, 5))
+        ret, later_frame = cap.read()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 1)  # reset
+
+        if not ret:
+            return None
+
+        gray_later = cv2.cvtColor(later_frame, cv2.COLOR_BGR2GRAY)
+        gray_later = cv2.GaussianBlur(gray_later, (21, 21), 0)
+
+        diff = cv2.absdiff(gray_first, gray_later)
+        _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        thresh = cv2.dilate(thresh, None, iterations=2)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        # Pick the largest contour
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 100:
+            return None
+
+        x, y, w, h = cv2.boundingRect(largest)
+        # Add some padding
+        pad = 20
+        x = max(0, x - pad)
+        y = max(0, y - pad)
+        w = w + 2 * pad
+        h = h + 2 * pad
+        return (x, y, w, h)
+
+    def _track_roi(
+        self,
+        cap: cv2.VideoCapture,
+        first_frame: np.ndarray,
+        roi: tuple[int, int, int, int],
+        fps: float,
+    ) -> Trajectory:
+        """Track a single ROI through the video using CSRT."""
+        tracker = cv2.TrackerCSRT.create()
+        tracker.init(first_frame, roi)
+
+        traj = Trajectory(object_id=0)
+        x, y, w, h = roi
+        traj.t.append(0.0)
+        traj.x.append(x + w / 2)
+        traj.y.append(y + h / 2)
+        traj.confidence.append(1.0)
+
+        frame_idx = 1
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            success, box = tracker.update(frame)
+            if success:
+                bx, by, bw, bh = [int(v) for v in box]
+                traj.t.append(frame_idx / fps)
+                traj.x.append(bx + bw / 2)
+                traj.y.append(by + bh / 2)
+                traj.confidence.append(1.0)
+            else:
+                traj.t.append(frame_idx / fps)
+                traj.x.append(traj.x[-1])  # hold last known position
+                traj.y.append(traj.y[-1])
+                traj.confidence.append(0.0)
+
+            frame_idx += 1
+
+        return traj
+
+    def _track_with_opencv(
+        self, cap: cv2.VideoCapture, first_frame: np.ndarray, fps: float
+    ) -> list[Trajectory]:
+        """Interactive tracking with OpenCV (for local development)."""
+        roi = self._detect_moving_object(cap, first_frame)
+        if roi is None:
+            raise ValueError(
+                "Could not auto-detect a moving object. "
+                "Use track_objects_auto() with a manual ROI."
+            )
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        cap.read()  # skip first frame (already have it)
+        return [self._track_roi(cap, first_frame, roi, fps)]

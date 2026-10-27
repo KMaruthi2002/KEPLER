@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Data (large files)
+data/videos/*.mp4
+data/videos/*.mov
+data/videos/*.avi
+data/trajectories/*.npy
+data/results/*.json
+!data/videos/.gitkeep
+!data/trajectories/.gitkeep
+!data/results/.gitkeep
+
+# Notebooks
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
