@@ -1,8 +1,8 @@
 # KEPLER default configuration
 
 tracking:
-  model: "sam-3.1"
-  backend: "baseten"
+  backend: "auto"  # "auto" tries sam2 first, falls back to opencv; also: "sam2", "opencv"
+  sam2_checkpoint: "facebook/sam2.1-hiera-large"  # HuggingFace model ID or local path
   confidence_threshold: 0.8
   max_objects: 10
   fps_target: 30

@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field
 
 
 class TrackingConfig(BaseModel):
-    model: str = "sam-3.1"
+    backend: str = "auto"  # "auto", "sam2", "opencv"
+    sam2_checkpoint: str = "facebook/sam2.1-hiera-large"
     confidence_threshold: float = 0.8
     max_objects: int = 10
     fps_target: int = 30
